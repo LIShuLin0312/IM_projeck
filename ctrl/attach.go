@@ -13,7 +13,7 @@ import (
 )
 
 func init(){
-	_ = os.MkdirAll("./mnt", os.ModePerm)
+	os.MkdirAll("./mnt",os.ModePerm)
 }
 func Upload(w http.ResponseWriter, r *http.Request){
 	//UploadLocal(w,r)

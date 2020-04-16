@@ -1,17 +1,15 @@
 package ctrl
 
 import (
-	"../model"
-	"../service"
-	"encoding/json"
-	"fmt"
+	"net/http"
 	"github.com/gorilla/websocket"
 	"gopkg.in/fatih/set.v0"
+			"sync"
+		"strconv"
 	"log"
-	"net/http"
-	"strconv"
-	"sync"
-)
+		"encoding/json"
+	"net"
+	)
 
 const (
 	CMD_SINGLE_MSG = 10
@@ -76,7 +74,7 @@ var rwlocker sync.RWMutex
 // ws://127.0.0.1/chat?id=1&token=xxxx
 func Chat(writer http.ResponseWriter,
 	request *http.Request) {
-
+	//fmt.Printf("%+v",request.Header)
 	//todo 检验接入是否合法
     //checkToken(userId int64,token string)
     query := request.URL.Query()
@@ -98,8 +96,8 @@ func Chat(writer http.ResponseWriter,
 	}
 	//todo 获得conn
 	node := &Node{
-		Conn:conn,//Websocket连接节点
-		DataQueue:make(chan []byte,50),//并行转串行数据.保证数据的发送顺序
+		Conn:conn,
+		DataQueue:make(chan []byte,50),
 		GroupSets:set.New(set.ThreadSafe),
 	}
 	//todo 获取用户全部群Id
@@ -109,39 +107,17 @@ func Chat(writer http.ResponseWriter,
 	}
 	//todo userid和node形成绑定关系
 	rwlocker.Lock()
-	clientMap[userId]=node //为了保证绑定关系的安全,需要读写锁控制
+	clientMap[userId]=node
 	rwlocker.Unlock()
 	//todo 完成发送逻辑,con
-	go sendproc(node,userId)
+	go sendproc(node)
 	//todo 完成接收逻辑
 	go recvproc(node)
+    log.Printf("<-%d\n",userId)
+	sendMsg(userId,[]byte("hello,world!"))
 }
 
-//发送协程
-func sendproc(node *Node,userId int64) {
-	lLen := service.RedisConn.LLen(fmt.Sprintf("%d", userId))//查询是否有离线缓存消息
-	if lLen.Val()>0{
-		//获取离线缓存的全部数据
-		for i:=int64(0);i<lLen.Val();i++{
-			data := service.RedisConn.LPop(fmt.Sprintf("%d",userId))
-			err := node.Conn.WriteMessage(websocket.TextMessage,[]byte(data.Val()))
-			if err!=nil{
-				log.Println(err.Error())
-				return
-			}
-		}
-	}
-	for {
-		select {
-			case data:= <-node.DataQueue:
-				err := node.Conn.WriteMessage(websocket.TextMessage,data)
-			    if err!=nil{
-			    	log.Println(err.Error())
-			    	return
-				}
-		}
-	}
-}
+
 //todo 添加新的群ID到用户的groupset中
 func AddGroupId(userId,gid int64){
 	//取得node
@@ -154,19 +130,97 @@ func AddGroupId(userId,gid int64){
 	rwlocker.Unlock()
 	//添加gid到set
 }
-//接收协程
+//ws发送协程
+func sendproc(node *Node) {
+	for {
+		select {
+		case data:= <-node.DataQueue:
+			err := node.Conn.WriteMessage(websocket.TextMessage,data)
+			if err!=nil{
+				log.Println(err.Error())
+				return
+			}
+		}
+	}
+}
+//ws接收协程
 func recvproc(node *Node) {
 	for{
-		_,data,err := node.Conn.ReadMessage()//读取websocket数据返回3个变量.1:数据类型,2:数据本身,3:错误信息
+		_,data,err := node.Conn.ReadMessage()
 		if err!=nil{
 			log.Println(err.Error())
 			return
 		}
-		//todo 对data进一步处理
-		dispatch(data)
-		//fmt.Printf("recv<=%s",data)
+		//dispatch(data)
+		//把消息广播到局域网
+		broadMsg(data)
+		log.Printf("[ws]<=%s\n",data)
 	}
 }
+
+func init(){
+	go udpsendproc()
+	go udprecvproc()
+}
+
+//用来存放发送的要广播的数据
+var  udpsendchan chan []byte=make(chan []byte,1024)
+//todo 将消息广播到局域网
+func broadMsg(data []byte){
+	udpsendchan<-data
+}
+//todo 完成udp数据的发送协程
+func udpsendproc(){
+	log.Println("start udpsendproc")
+	//todo 使用udp协议拨号
+	con,err:=net.DialUDP("udp",nil,
+		&net.UDPAddr{
+			IP:net.IPv4(192,168,0,255),
+			Port:3000,
+		})
+	defer con.Close()
+	if err!=nil{
+		log.Println(err.Error())
+		return
+	}
+	//todo 通过的到的con发送消息
+	//con.Write()
+	for{
+		select {
+		case data := <- udpsendchan:
+			_,err=con.Write(data)
+			if err!=nil{
+				log.Println(err.Error())
+				return
+			}
+		}
+	}
+}
+//todo 完成upd接收并处理功能
+func udprecvproc(){
+	log.Println("start udprecvproc")
+	 //todo 监听udp广播端口
+	 con,err:=net.ListenUDP("udp",&net.UDPAddr{
+	 	IP:net.IPv4zero,
+	 	Port:3000,
+	 })
+	 defer con.Close()
+	 if err!=nil{log.Println(err.Error())}
+	//TODO 处理端口发过来的数据
+	for{
+		var buf [512]byte
+		n,err:=con.Read(buf[0:])
+		if err!=nil{
+			log.Println(err.Error())
+			return
+		}
+		//直接数据处理
+		dispatch(buf[0:n])
+	}
+	log.Println("stop updrecvproc")
+}
+
+
 //后端调度逻辑处理
 func dispatch(data[]byte){
 	//todo 解析data为message
@@ -194,20 +248,11 @@ func dispatch(data[]byte){
 
 //todo 发送消息
 func sendMsg(userId int64,msg []byte) {
-	rwlocker.RLock() //不直接用sync.LOCK是为了保证是同一把锁
-	node,ok:=clientMap[userId] //读取用户websocket数据,保护存储用户的map安全,此处需要加锁
+	rwlocker.RLock()
+	node,ok:=clientMap[userId]
 	rwlocker.RUnlock()
 	if ok{
 		node.DataQueue<- msg
-	}else {
-		userinfo := model.User{}
-		exist, err := service.DbEngin.Where("id = ?", userId).Get(&userinfo)
-		if err != nil {
-			log.Println(err.Error())
-		}
-		if exist{
-			service.RedisConn.RPush(fmt.Sprintf("%d", userinfo.Id),msg)
-		}
 	}
 }
 //检测是否有效
